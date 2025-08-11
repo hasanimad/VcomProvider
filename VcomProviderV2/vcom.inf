@@ -1,0 +1,58 @@
+; vcom.inf — Minimal KMDF INF for a root-enumerated virtual COM device
+; Targets Windows 10+ (build 16299+) and uses the Ports class so tools see a COM port
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Ports
+ClassGuid   = {4d36e978-e325-11ce-bfc1-08002be10318}  ; Ports (COM & LPT)
+Provider    = %ManufacturerName%
+CatalogFile = vcom.cat
+PnpLockdown = 1
+DriverVer   = 08/11/2025,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 13   ; %SystemRoot%\System32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+VcomProviderV2.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%Vcom.DeviceDesc% = Vcom_Install, ROOT\VCOM_VPORT
+
+; ===================== Install (DDInstall) =====================
+[Vcom_Install.NT]
+CopyFiles = Vcom.Copy
+
+[Vcom.Copy]
+VcomProviderV2.sys
+
+[Vcom_Install.NT.Services]
+AddService = vcom,%SPSVCINST_ASSOCSERVICE%, Vcom.Service
+
+[Vcom.Service]
+DisplayName   = %Vcom.ServiceDesc%
+ServiceType   = 1                 ; SERVICE_KERNEL_DRIVER
+StartType     = 3                 ; SERVICE_DEMAND_START (or 2 for auto-start)
+ErrorControl  = 1                 ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\VcomProviderV2.sys
+
+; ===================== KMDF =====================
+[Vcom_Install.NT.Wdf]
+KmdfService = vcom, Vcom.Wdf
+
+[Vcom.Wdf]
+KmdfLibraryVersion = $KMDFVERSION$
+
+; ===================== Strings =====================
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "Hasan"
+DiskName = "VCOM Driver"
+Vcom.DeviceDesc = "VCOM Virtual Serial Port"
+Vcom.ServiceDesc = "VCOM Virtual Serial Port Driver"
