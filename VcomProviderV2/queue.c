@@ -41,6 +41,7 @@ QueueCreate(
     queueContext = GetQueueContext(queue);
     queueContext->Queue = queue;
     queueContext->DeviceContext = DeviceContext;
+    queueContext->DeviceContext->IoQueue = queue; // let cleanup reach our manual queues & rings
 
     // Initialize small state
     queueContext->CommandMatchState = COMMAND_MATCH_STATE_IDLE;
