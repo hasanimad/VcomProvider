@@ -1,6 +1,7 @@
 #include <initguid.h>
 #include "common.h"
-extern "C"
+
+
 NTSTATUS DriverEntry(
 	PDRIVER_OBJECT DriverObject,
 	PUNICODE_STRING RegistryPath

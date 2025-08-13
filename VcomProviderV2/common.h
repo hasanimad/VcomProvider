@@ -4,7 +4,7 @@
 #else
 #include <windows.h>
 #endif
-//#include <winioctl.h>
+#include <Ntstrsafe.h>
 #include <wdf.h>
 
 

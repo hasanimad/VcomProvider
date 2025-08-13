@@ -10,6 +10,7 @@ NTSTATUS DeviceCreate(
 
     NTSTATUS status;
 	WDF_OBJECT_ATTRIBUTES deviceAttributes;
+	WDF_FILEOBJECT_CONFIG fileCfg;
     WDFDEVICE device;
 	PDEVICE_CONTEXT pDeviceContext;
 
@@ -18,9 +19,18 @@ NTSTATUS DeviceCreate(
 	deviceAttributes.SynchronizationScope = WdfSynchronizationScopeDevice;
 	deviceAttributes.EvtCleanupCallback = VcomEvtDeviceCleanup;
 
+	WDF_FILEOBJECT_CONFIG_INIT(&fileCfg,
+		VcomEvtFileCreate,   // EvtDeviceFileCreate
+		VcomEvtFileClose,    // EvtFileClose
+		VcomEvtFileCleanup); // EvtFileCleanup
+
 	WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_SERIAL_PORT);
-	WdfDeviceInitSetExclusive(DeviceInit, FALSE);
 	WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
+
+	WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileCfg, WDF_NO_OBJECT_ATTRIBUTES);
+
+	
+	WdfDeviceInitSetExclusive(DeviceInit, TRUE);
 
 	status = WdfDeviceCreate(
 		&DeviceInit, 
@@ -42,7 +52,7 @@ NTSTATUS DeviceCreate(
 	RtlZeroMemory(&pDeviceContext->Timeouts, sizeof(pDeviceContext->Timeouts));
 	pDeviceContext->FlowControl = 0;
 
-	pDeviceContext->PdoName = nullptr;
+	pDeviceContext->PdoName = NULL;
 	pDeviceContext->bCreatedLegacyHardwareKey = FALSE;
 
 	RtlZeroMemory(&pDeviceContext->Config, sizeof(pDeviceContext->Config));
@@ -58,7 +68,7 @@ NTSTATUS DeviceConfigure(
 ){
 	NTSTATUS status;
 	WDFDEVICE device = DeviceContext->Device;
-	WDFKEY registryKey = nullptr;
+	WDFKEY registryKey = NULL;
 	LPGUID guid;
 	errno_t errorNo;
 
@@ -92,9 +102,12 @@ NTSTATUS DeviceConfigure(
 		&portName,
 		NULL,
 		&comPort);
-	if(!NT_SUCCESS(status)) {
-		KdPrint(("Failed to query Port Name with status 0x%08X\n", status));
-		goto _exit;
+	if (!NT_SUCCESS(status)) {
+		KdPrint(("PortName not found under device key (status 0x%08X). Using fallback.\n", status));
+		RtlZeroMemory(comPort.Buffer, comPort.MaximumLength);
+		RtlStringCchCopyW(comPort.Buffer, comPort.MaximumLength / sizeof(WCHAR), L"COM250");
+		comPort.Length = (USHORT)(wcslen(comPort.Buffer) * sizeof(WCHAR));
+		status = STATUS_SUCCESS; // continue
 	}
 	symbolicLinkName.Length = (USHORT)((wcslen(comPort.Buffer) * sizeof(wchar_t))
 		+ sizeof(SYMBOLIC_LINK_NAME_PREFIX) - sizeof(UNICODE_NULL));
@@ -199,7 +212,7 @@ NTSTATUS DeviceWriteLegacyHardwareKey(
 	_In_ WDFDEVICE Device
 	)
 {
-	WDFKEY key = nullptr;
+	WDFKEY key = NULL;
 	NTSTATUS status;
 	UNICODE_STRING pdoString = { 0 };
 	UNICODE_STRING comPort = { 0 };
@@ -230,7 +243,7 @@ NTSTATUS DeviceWriteLegacyHardwareKey(
 _exit:
 	if(key) {
 		WdfRegistryClose(key);
-		key = nullptr;
+		key = NULL;
 	}
 	return status;
 }
@@ -242,7 +255,7 @@ VOID VcomEvtDeviceCleanup(
 	WDFDEVICE device = (WDFDEVICE)Device;
 	PDEVICE_CONTEXT deviceContext = GetDeviceContext(device);
 	NTSTATUS status;
-	WDFKEY key = nullptr;
+	WDFKEY key = NULL;
 	UNICODE_STRING PdoString = { 0 };
 
 	DECLARE_CONST_UNICODE_STRING(deviceSubkey, SERIAL_DEVICE_MAP);
@@ -273,17 +286,64 @@ VOID VcomEvtDeviceCleanup(
 	}
 _exit:
 
-	if (key != nullptr) {
+	if (key != NULL) {
 		WdfRegistryClose(key);
-		key = nullptr;
+		key = NULL;
 	}
 	return;
 
 }
 
+VOID
+VcomEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
+{
+	WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
+	PDEVICE_CONTEXT dev = GetDeviceContext(device);
+
+	// Reach our queue state
+	if (dev->IoQueue) {
+		PQUEUE_CONTEXT qc = GetQueueContext(dev->IoQueue);
+
+		// Cancel/purge any pending requests from this file (single-open, so safe)
+		WdfIoQueuePurgeSynchronously(qc->ReadQueue);
+		WdfIoQueuePurgeSynchronously(qc->OutgoingQueue);
+		WdfIoQueuePurgeSynchronously(qc->WaitMaskQueue);
+
+		// Reset rings
+		WdfSpinLockAcquire(qc->RingBufferFromNetworkLock);
+		RingBufferReset(&qc->RingBufferFromNetwork);
+		WdfSpinLockRelease(qc->RingBufferFromNetworkLock);
+
+		WdfSpinLockAcquire(qc->RingBufferToUserModeLock);
+		RingBufferReset(&qc->RingBufferToUserMode);
+		WdfSpinLockRelease(qc->RingBufferToUserModeLock);
+	}
+}
+
+VOID
+VcomEvtFileClose(_In_ WDFFILEOBJECT FileObject)
+{
+	UNREFERENCED_PARAMETER(FileObject);
+	// Nothing else to do; Cleanup already purged/cleared
+}
+
+VOID
+VcomEvtFileCreate(
+	_In_ WDFDEVICE     Device,
+	_In_ WDFREQUEST    Request,
+	_In_ WDFFILEOBJECT FileObject
+)
+{
+	UNREFERENCED_PARAMETER(Device);
+	UNREFERENCED_PARAMETER(FileObject);
+	// With Exclusive=TRUE the framework enforces single-open for us.
+	WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
 ULONG GetBaudRate(_In_ PDEVICE_CONTEXT Ctx) {
 	return (ULONG)ReadNoFence((LONG*)&Ctx->BaudRate);
 }
+
 VOID SetBaudRate(
 	_Inout_ PDEVICE_CONTEXT Ctx,
 	_In_ ULONG BaudRate

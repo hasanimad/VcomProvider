@@ -47,16 +47,16 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="driver.cpp">
+    <ClCompile Include="driver.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="device.cpp">
+    <ClCompile Include="device.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="queue.cpp">
+    <ClCompile Include="queue.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="ringbuffer.cpp">
+    <ClCompile Include="ringbuffer.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

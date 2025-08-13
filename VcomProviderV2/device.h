@@ -14,7 +14,7 @@
 typedef struct _DEVICE_CONTEXT {
 	WDFDEVICE Device; 
 	
-	//WDFQUEUE IoQueue; // Not needed
+	WDFQUEUE IoQueue; // To clean up the queue on device close
 	
 	ULONG           BaudRate;
 	ULONG           ModemControlRegister;
@@ -34,6 +34,10 @@ typedef struct _DEVICE_CONTEXT {
 } DEVICE_CONTEXT, * PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext);
+
+EVT_WDF_DEVICE_FILE_CREATE VcomEvtFileCreate;
+EVT_WDF_FILE_CLOSE         VcomEvtFileClose;
+EVT_WDF_FILE_CLEANUP       VcomEvtFileCleanup;
 
 NTSTATUS 
 DeviceCreate(
