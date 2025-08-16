@@ -1,6 +1,12 @@
 #pragma once
 
 
+typedef struct _FILE_OBJECT_CONTEXT {
+	BOOLEAN IsComPortHandle;
+} FILE_OBJECT_CONTEXT, * PFILE_OBJECT_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILE_OBJECT_CONTEXT, GetFileObjectContext);
+
 // Symbolic link info for your virtual COM ports
 #define SYMBOLIC_LINK_NAME_LENGTH   64
 #define SYMBOLIC_LINK_NAME_PREFIX   L"\\DosDevices\\Global\\"
@@ -16,6 +22,7 @@ typedef struct _DEVICE_CONTEXT {
 	
 	WDFQUEUE IoQueue; // To clean up the queue on device close
 	
+	volatile BOOLEAN Started;      // gate I/O
 	ULONG           BaudRate;
 	ULONG           ModemControlRegister;
 	ULONG           FifoControlRegister;
@@ -28,8 +35,8 @@ typedef struct _DEVICE_CONTEXT {
 	PWSTR PdoName;
 	BOOLEAN bCreatedLegacyHardwareKey;
 
-	// Networking Specific State
-	VCOM_CONFIG Config;
+	WDFFILEOBJECT ComPortFileObject;
+	BOOLEAN ComPortIsOpen;
 
 } DEVICE_CONTEXT, * PDEVICE_CONTEXT;
 

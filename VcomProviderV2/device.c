@@ -1,49 +1,55 @@
 #include "common.h"
 
-NTSTATUS DeviceCreate(
-    _In_ WDFDRIVER Driver,
-    _In_ PWDFDEVICE_INIT DeviceInit,
-    _Out_ PDEVICE_CONTEXT* DeviceContext
+NTSTATUS
+DeviceCreate(
+	_In_ WDFDRIVER Driver,
+	_In_ PWDFDEVICE_INIT DeviceInit,
+	_Out_ PDEVICE_CONTEXT* DeviceContext
 )
 {
 	UNREFERENCED_PARAMETER(Driver);
 
-    NTSTATUS status;
+	NTSTATUS status;
 	WDF_OBJECT_ATTRIBUTES deviceAttributes;
 	WDF_FILEOBJECT_CONFIG fileCfg;
-    WDFDEVICE device;
+	WDFDEVICE device;
 	PDEVICE_CONTEXT pDeviceContext;
 
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, DEVICE_CONTEXT);
-
-	deviceAttributes.SynchronizationScope = WdfSynchronizationScopeDevice;
 	deviceAttributes.EvtCleanupCallback = VcomEvtDeviceCleanup;
 
-	WDF_FILEOBJECT_CONFIG_INIT(&fileCfg,
-		VcomEvtFileCreate,   // EvtDeviceFileCreate
-		VcomEvtFileClose,    // EvtFileClose
-		VcomEvtFileCleanup); // EvtFileCleanup
+	WDF_FILEOBJECT_CONFIG_INIT(
+		&fileCfg,
+		VcomEvtFileCreate,
+		VcomEvtFileClose,
+		VcomEvtFileCleanup);
+
+	// Use WDF_NO_OBJECT_ATTRIBUTES for the file object config.
+	// This resolves the 0xC0000010 error.
+	WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileCfg, WDF_NO_OBJECT_ATTRIBUTES);
 
 	WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_SERIAL_PORT);
 	WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
 
-	WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileCfg, WDF_NO_OBJECT_ATTRIBUTES);
-
-	
-	WdfDeviceInitSetExclusive(DeviceInit, TRUE);
-
 	status = WdfDeviceCreate(
-		&DeviceInit, 
-		&deviceAttributes, 
+		&DeviceInit,
+		&deviceAttributes,
 		&device);
+
 	if (!NT_SUCCESS(status)) {
 		KdPrint(("WdfDeviceCreate failed with status 0x%08X\n", status));
 		return status;
 	}
+
 	pDeviceContext = GetDeviceContext(device);
 	pDeviceContext->Device = device;
+	pDeviceContext->Started = TRUE;
 
-	// Safe defaults for a fresh virtual COM device
+	// Initialize our manual lock fields
+	pDeviceContext->ComPortIsOpen = FALSE;
+	pDeviceContext->ComPortFileObject = NULL;
+
+	// Initialize standard serial port state
 	pDeviceContext->BaudRate = 9600;
 	pDeviceContext->ModemControlRegister = 0;
 	pDeviceContext->FifoControlRegister = 0;
@@ -51,16 +57,11 @@ NTSTATUS DeviceCreate(
 	pDeviceContext->ValidDataMask = 0xFF;
 	RtlZeroMemory(&pDeviceContext->Timeouts, sizeof(pDeviceContext->Timeouts));
 	pDeviceContext->FlowControl = 0;
-
 	pDeviceContext->PdoName = NULL;
 	pDeviceContext->bCreatedLegacyHardwareKey = FALSE;
 
-	RtlZeroMemory(&pDeviceContext->Config, sizeof(pDeviceContext->Config));
-	pDeviceContext->Config.TransportType = VcomTransportUdp;
-
 	*DeviceContext = pDeviceContext;
-	    
-    return status;
+	return status;
 }
 
 NTSTATUS DeviceConfigure(
@@ -85,6 +86,19 @@ NTSTATUS DeviceConfigure(
 	if (!NT_SUCCESS(status)) {
 		KdPrint(("Device Interface Creation failed with status 0x%08X\n", status));
 		goto _exit;
+	}
+
+	status = WdfDeviceCreateDeviceInterface(
+		device,
+		&GUID_DEVINTERFACE_VCOM_CONTROL, // Our custom private GUID
+		NULL);                           // No reference string
+
+	if (!NT_SUCCESS(status)) {
+		KdPrint(("Device Interface Creation (Control) failed with status 0x%08X\n", status));
+		return status;
+	}
+	else {
+		KdPrint(("Device Interface Creation (Control) succeeded\n"));
 	}
 
 	status = WdfDeviceOpenRegistryKey(
@@ -295,21 +309,29 @@ _exit:
 }
 
 VOID
-VcomEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
+VcomEvtFileCleanup(
+	_In_ WDFFILEOBJECT FileObject
+)
 {
 	WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
-	PDEVICE_CONTEXT dev = GetDeviceContext(device);
+	PDEVICE_CONTEXT devCtx = GetDeviceContext(device);
 
-	// Reach our queue state
-	if (dev->IoQueue) {
-		PQUEUE_CONTEXT qc = GetQueueContext(dev->IoQueue);
+	// Check if the handle being closed is the one we stored for the COM port.
+	if (devCtx->ComPortFileObject == FileObject)
+	{
+		// It is. This means PuTTY (or another COM app) is closing.
+		// Release the lock so another app can connect.
+		KdPrint(("VCOM: COM port handle closed. Releasing lock.\n"));
+		devCtx->ComPortIsOpen = FALSE;
+		devCtx->ComPortFileObject = NULL; // Clear the stored handle
+	}
 
-		// Cancel/purge any pending requests from this file (single-open, so safe)
+	// Perform standard queue and buffer cleanup for all closing handles.
+	if (devCtx->IoQueue) {
+		PQUEUE_CONTEXT qc = GetQueueContext(devCtx->IoQueue);
 		WdfIoQueuePurgeSynchronously(qc->ReadQueue);
 		WdfIoQueuePurgeSynchronously(qc->OutgoingQueue);
-		WdfIoQueuePurgeSynchronously(qc->WaitMaskQueue);
 
-		// Reset rings
 		WdfSpinLockAcquire(qc->RingBufferFromNetworkLock);
 		RingBufferReset(&qc->RingBufferFromNetwork);
 		WdfSpinLockRelease(qc->RingBufferFromNetworkLock);
@@ -334,9 +356,29 @@ VcomEvtFileCreate(
 	_In_ WDFFILEOBJECT FileObject
 )
 {
-	UNREFERENCED_PARAMETER(Device);
-	UNREFERENCED_PARAMETER(FileObject);
-	// With Exclusive=TRUE the framework enforces single-open for us.
+	PDEVICE_CONTEXT devCtx = GetDeviceContext(Device);
+	PUNICODE_STRING fileName = WdfFileObjectGetFileName(FileObject);
+
+	// Check if the open request is for the public COM port by checking for a filename.
+	if (fileName != NULL && fileName->Length > 0)
+	{
+		// This is a COM port open request (e.g., from PuTTY).
+		// Check our manual lock.
+		if (devCtx->ComPortIsOpen)
+		{
+			// Port is already open. Deny access.
+			WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
+			return;
+		}
+		else
+		{
+			// Port is available. Grant access, set the lock, and store the handle.
+			devCtx->ComPortIsOpen = TRUE;
+			devCtx->ComPortFileObject = FileObject;
+		}
+	}
+	// If there's no filename, it's our private control app. Always allow it.
+
 	WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 

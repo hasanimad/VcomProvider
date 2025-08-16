@@ -49,6 +49,8 @@ Abstract:
 
 #else
 
+#include <winioctl.h>
+
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Instead of #include <ntddser.h>, the following are copied from that header,
@@ -121,8 +123,3 @@ typedef struct _SERIAL_TIMEOUTS {
 #define SPACE_PARITY     4
 
 #endif  // #ifdef _KERNEL_MODE, #include <ntddser.h>
-
-//
-// DEFINE_GUID(GUID_DEVINTERFACE_MODEM, 0x2c7089aa, 0x2e0e, 0x11d1, 0xb1, 0x14, 0x00, 0xc0, 0x4f, 0xc2, 0xaa, 0xe4);
-//
-#include <ntddmodm.h>

@@ -43,20 +43,14 @@ QueueCreate(
     queueContext->DeviceContext = DeviceContext;
     queueContext->DeviceContext->IoQueue = queue; // let cleanup reach our manual queues & rings
 
-    // Initialize small state
-    queueContext->CommandMatchState = COMMAND_MATCH_STATE_IDLE;
-    queueContext->ConnectCommand = FALSE;
-    queueContext->IgnoreNextChar = FALSE;
-    queueContext->ConnectionStateChanged = FALSE;
-    queueContext->CurrentlyConnected = FALSE;
-
     // ================================
     // 2) Manual queue for pending reads (IRP_MJ_READ)
     // ================================
     WDF_IO_QUEUE_CONFIG_INIT(
         &queueConfig,
         WdfIoQueueDispatchManual);
-
+	queueConfig.PowerManaged = WdfTrue;
+    queueConfig.EvtIoCanceledOnQueue = EvtIoCanceledOnQueue;
     status = WdfIoQueueCreate(
         device,
         &queueConfig,
@@ -72,34 +66,13 @@ QueueCreate(
     queueContext->ReadQueue = queue;
 
     // ================================
-    // 3) Manual queue for IOCTL_SERIAL_WAIT_ON_MASK
+    // 3) Manual queue for pending IOCTL_VCOM_GET_OUTGOING
     // ================================
     WDF_IO_QUEUE_CONFIG_INIT(
         &queueConfig,
         WdfIoQueueDispatchManual);
-
-    status = WdfIoQueueCreate(
-        device,
-        &queueConfig,
-        WDF_NO_OBJECT_ATTRIBUTES,
-        &queue);
-
-    if (!NT_SUCCESS(status)) {
-        Trace(TRACE_LEVEL_ERROR,
-            "Error: WdfIoQueueCreate WaitMaskQueue failed 0x%x", status);
-        return status;
-    }
-
-    queueContext->WaitMaskQueue = queue;
-
-    // ================================
-    // 4) Manual queue for pending IOCTL_VCOM_GET_OUTGOING
-    // ================================
-    WDF_IO_QUEUE_CONFIG_INIT(
-        &queueConfig,
-        WdfIoQueueDispatchManual);
-    queueConfig.PowerManaged = WdfTrue; // match other manual queues
-
+    queueConfig.PowerManaged = WdfFalse;
+    queueConfig.EvtIoCanceledOnQueue = EvtIoCanceledOnQueue;
     status = WdfIoQueueCreate(
         device,
         &queueConfig,
@@ -113,7 +86,7 @@ QueueCreate(
     }
 
     // ================================
-    // 5) Create spinlocks for each ring
+    // 4) Create spinlocks for each ring
     // ================================
     status = WdfSpinLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &queueContext->RingBufferToUserModeLock);
     if (!NT_SUCCESS(status)) {
@@ -128,7 +101,7 @@ QueueCreate(
     }
 
     // ================================
-    // 6) Allocate nonpaged backing storage via KMDF and init rings
+    // 5) Allocate nonpaged backing storage via KMDF and init rings
     // ================================
     WDF_OBJECT_ATTRIBUTES memAttr;
     WDF_OBJECT_ATTRIBUTES_INIT(&memAttr);
@@ -329,28 +302,22 @@ EvtIoDeviceControl(
 
     case IOCTL_SERIAL_WAIT_ON_MASK:
     {
-        WDFREQUEST savedRequest;
-        status = WdfIoQueueRetrieveNextRequest(queueContext->WaitMaskQueue, &savedRequest);
-        if (NT_SUCCESS(status)) {
-            WdfRequestComplete(savedRequest, STATUS_UNSUCCESSFUL);
-        }
-        status = WdfRequestForwardToIoQueue(Request, queueContext->WaitMaskQueue);
+        // For our simple pipe, we don't implement this. We will just hold
+        // the request and never complete it, which is valid behavior for a
+        // serial port where the requested event might never occur.
+        // To prevent the request from being held forever and leaking if the
+        // handle is closed, we forward it to a queue that gets purged.
+        // The main default queue works for this.
+        status = WdfRequestForwardToIoQueue(Request, Queue);
         if (!NT_SUCCESS(status)) {
-            Trace(TRACE_LEVEL_ERROR, "Error: WdfRequestForwardToIoQueue failed 0x%x", status);
             WdfRequestComplete(Request, status);
         }
-        return; // don't complete here
+        return; // Must return here, do not complete below.
     }
 
     case IOCTL_SERIAL_SET_WAIT_MASK:
     {
-        WDFREQUEST savedRequest;
-        status = WdfIoQueueRetrieveNextRequest(queueContext->WaitMaskQueue, &savedRequest);
-        if (NT_SUCCESS(status)) {
-            ULONG eventMask = 0;
-            status = RequestCopyFromBuffer(savedRequest, &eventMask, sizeof(eventMask));
-            WdfRequestComplete(savedRequest, status);
-        }
+        // We don't track the wait mask, so we can just succeed this request.
         status = STATUS_SUCCESS;
         break;
     }
@@ -368,7 +335,105 @@ EvtIoDeviceControl(
     case IOCTL_SERIAL_RESET_DEVICE:
         status = STATUS_SUCCESS;
         break;
+    case IOCTL_VCOM_GET_OUTGOING:
+    {
+        if (!deviceContext->Started) { status = STATUS_DEVICE_NOT_READY; break; }
 
+        PVOID outBuf = NULL;
+        size_t outLen = 0, copied = 0;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, 1, &outBuf, &outLen);
+        if (!NT_SUCCESS(status)) break;
+
+        if (outLen == 0) { WdfRequestSetInformation(Request, 0); status = STATUS_SUCCESS; break; }
+
+        WdfSpinLockAcquire(queueContext->RingBufferToUserModeLock);
+        status = RingBufferRead(&queueContext->RingBufferToUserMode,
+            (BYTE*)outBuf, outLen, &copied);
+        WdfSpinLockRelease(queueContext->RingBufferToUserModeLock);
+        if (!NT_SUCCESS(status)) break;
+
+        if (copied > 0) {
+            WdfRequestSetInformation(Request, copied);
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        // No data: pend on manual OutgoingQueue
+        status = WdfRequestForwardToIoQueue(Request, queueContext->OutgoingQueue);
+        if (!NT_SUCCESS(status)) {
+            Trace(TRACE_LEVEL_ERROR, "GET_OUTGOING forward failed 0x%x", status);
+            WdfRequestComplete(Request, status);
+        }
+        return; // don't complete here
+    }
+    case IOCTL_VCOM_PUSH_INCOMING:
+    {
+        if (!deviceContext->Started) { status = STATUS_DEVICE_NOT_READY; break; }
+
+        WDFMEMORY inMem;
+        size_t inLen = 0, wrote = 0;
+        status = WdfRequestRetrieveInputMemory(Request, &inMem);
+        if (!NT_SUCCESS(status)) break;
+
+        BYTE* src = (BYTE*)WdfMemoryGetBuffer(inMem, &inLen);
+
+        if (src && inLen) {
+            WdfSpinLockAcquire(queueContext->RingBufferFromNetworkLock);
+            status = RingBufferWritePartial(&queueContext->RingBufferFromNetwork, src, inLen, &wrote);
+            WdfSpinLockRelease(queueContext->RingBufferFromNetworkLock);
+            // STATUS_SUCCESS if fully accepted, STATUS_BUFFER_OVERFLOW if partial
+            if (status == STATUS_BUFFER_OVERFLOW) status = STATUS_SUCCESS; // we return success + byte count
+        }
+
+        // Wake pending reads — re-dispatch to default queue so EvtIoRead can copy
+        for (;;) {
+            WDFREQUEST rd;
+            NTSTATUS s2 = WdfIoQueueRetrieveNextRequest(queueContext->ReadQueue, &rd);
+            if (!NT_SUCCESS(s2)) break;
+            s2 = WdfRequestForwardToIoQueue(rd, queueContext->Queue);
+            if (!NT_SUCCESS(s2)) {
+                Trace(TRACE_LEVEL_ERROR, "Forward read after PUSH failed 0x%x", s2);
+                WdfRequestComplete(rd, s2);
+            }
+        }
+
+        WdfRequestSetInformation(Request, wrote);
+        break;
+    }
+    
+    case IOCTL_VCOM_START:
+    {
+        deviceContext->Started = TRUE;
+        WdfSpinLockAcquire(queueContext->RingBufferToUserModeLock);
+        RingBufferReset(&queueContext->RingBufferToUserMode);
+        WdfSpinLockRelease(queueContext->RingBufferToUserModeLock);
+
+        WdfSpinLockAcquire(queueContext->RingBufferFromNetworkLock);
+        RingBufferReset(&queueContext->RingBufferFromNetwork);
+        WdfSpinLockRelease(queueContext->RingBufferFromNetworkLock);
+
+        status = STATUS_SUCCESS;
+        break;
+    }
+    case IOCTL_VCOM_STOP:
+    {
+        deviceContext->Started = FALSE;
+        WdfIoQueuePurgeSynchronously(queueContext->ReadQueue);
+        WdfIoQueuePurgeSynchronously(queueContext->OutgoingQueue);
+        
+
+        WdfSpinLockAcquire(queueContext->RingBufferToUserModeLock);
+        RingBufferReset(&queueContext->RingBufferToUserMode);
+        WdfSpinLockRelease(queueContext->RingBufferToUserModeLock);
+
+        WdfSpinLockAcquire(queueContext->RingBufferFromNetworkLock);
+        RingBufferReset(&queueContext->RingBufferFromNetwork);
+        WdfSpinLockRelease(queueContext->RingBufferFromNetworkLock);
+
+        status = STATUS_SUCCESS;
+        break;
+    }
     default:
         status = STATUS_INVALID_PARAMETER;
         break;
@@ -388,10 +453,16 @@ EvtIoWrite(
     NTSTATUS                status;
     PQUEUE_CONTEXT          queueContext = GetQueueContext(Queue);
     WDFMEMORY               memory;
-    WDFREQUEST              savedRequest;
+    //WDFREQUEST              savedRequest;
     size_t                  availableData = 0;
 
     Trace(TRACE_LEVEL_INFO, "EvtIoWrite 0x%p", Request);
+    
+    if (!queueContext->DeviceContext->Started) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+
+    }
 
     status = WdfRequestRetrieveInputMemory(Request, &memory);
     if (!NT_SUCCESS(status)) {
@@ -420,15 +491,53 @@ EvtIoWrite(
     }
 
     // Wake any pending GET_OUTGOING requests by re-dispatching them
+    // Satisfy pending GET_OUTGOING
     for (;;) {
-        status = WdfIoQueueRetrieveNextRequest(queueContext->OutgoingQueue, &savedRequest);
-        if (!NT_SUCCESS(status)) {
-            break; // no more pending
+        WDFREQUEST      getOutgoingRequest;
+        NTSTATUS        s;
+
+        s = WdfIoQueueRetrieveNextRequest(queueContext->OutgoingQueue, &getOutgoingRequest);
+        if (!NT_SUCCESS(s)) {
+            // No more pending requests to fulfill
+            break;
         }
-        status = WdfRequestForwardToIoQueue(savedRequest, Queue);
-        if (!NT_SUCCESS(status)) {
-            Trace(TRACE_LEVEL_ERROR, "Error: WdfRequestForwardToIoQueue failed 0x%x", status);
-            WdfRequestComplete(savedRequest, status);
+
+        // We have a pending IOCTL. Let's try to complete it.
+        PVOID   outputBuffer = NULL;
+        size_t  outputBufferLength = 0;
+        size_t  bytesCopied = 0;
+
+        s = WdfRequestRetrieveOutputBuffer(getOutgoingRequest, 1, &outputBuffer, &outputBufferLength);
+        if (!NT_SUCCESS(s)) {
+            // Failed to get buffer, complete with an error.
+            WdfRequestComplete(getOutgoingRequest, s);
+            continue;
+        }
+
+        // Read from the ring buffer into the IOCTL's buffer
+        WdfSpinLockAcquire(queueContext->RingBufferToUserModeLock);
+        RingBufferRead(
+            &queueContext->RingBufferToUserMode,
+            (BYTE*)outputBuffer,
+            outputBufferLength,
+            &bytesCopied
+        );
+        WdfSpinLockRelease(queueContext->RingBufferToUserModeLock);
+
+        if (bytesCopied > 0) {
+            // We read some data, complete the request successfully.
+            WdfRequestCompleteWithInformation(getOutgoingRequest, STATUS_SUCCESS, bytesCopied);
+        }
+        else {
+            // Race condition: data was drained by another thread between our check
+            // and retrieving the request. Re-queue it.
+            s = WdfRequestForwardToIoQueue(getOutgoingRequest, queueContext->OutgoingQueue);
+            if (!NT_SUCCESS(s)) {
+                // If forwarding fails (e.g., queue is being purged), complete it to prevent a leak.
+                WdfRequestComplete(getOutgoingRequest, s);
+            }
+            // The ring buffer is empty now, so no point in trying to wake more requests.
+            break;
         }
     }
 }
@@ -447,6 +556,12 @@ EvtIoRead(
     size_t                  bytesCopied = 0;
 
     Trace(TRACE_LEVEL_INFO, "EvtIoRead 0x%p", Request);
+
+    if (!queueContext->DeviceContext->Started) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+        
+    }
 
     status = WdfRequestRetrieveOutputMemory(Request, &memory);
     if (!NT_SUCCESS(status)) {
@@ -481,6 +596,12 @@ EvtIoRead(
     }
 }
 
+VOID
+EvtIoCanceledOnQueue(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(Queue);
+    WdfRequestComplete(Request, STATUS_CANCELLED);
+}
 
 NTSTATUS
 QueueProcessWriteBytes(
@@ -489,89 +610,62 @@ QueueProcessWriteBytes(
     _In_  size_t            Length
 )
 /*++
-This is still the sample's parser; we now write bytes into the OUTGOING ring
-so user-mode can drain them. We'll keep the old AT/OK/CONNECT injection for now
-(to be removed later).
+Routine Description:
+
+    This function takes the data from an application's write request and
+    places it into the outgoing ring buffer. This buffer is then drained
+    by the user-mode client application via the IOCTL_VCOM_GET_OUTGOING
+    request, effectively creating a pipe from the virtual serial port to
+    the client application.
+
+Arguments:
+
+    QueueContext - A pointer to the queue's context space.
+
+    Characters - A pointer to the buffer containing the data to be written.
+
+    Length - The number of bytes to write from the Characters buffer.
+
+Return Value:
+
+    STATUS_SUCCESS if the data was written successfully.
+    An appropriate NTSTATUS error code otherwise.
+
 --*/
 {
-    NTSTATUS                status = STATUS_SUCCESS;
-    UCHAR                   currentCharacter;
-    UCHAR                   connectString[] = "\r\nCONNECT\r\n";
-    UCHAR                   connectStringCch = ARRAY_SIZE(connectString) - 1;
-    UCHAR                   okString[] = "\r\nOK\r\n";
-    UCHAR                   okStringCch = ARRAY_SIZE(okString) - 1;
+    NTSTATUS status;
+    size_t   bytesWritten = 0;
 
-    while (Length != 0) {
-        currentCharacter = *(Characters++);
-        Length--;
-        if (currentCharacter == '\0') {
-            continue;
-        }
-
-        WdfSpinLockAcquire(QueueContext->RingBufferToUserModeLock);
-        status = RingBufferWrite(&QueueContext->RingBufferToUserMode,
-            &currentCharacter,
-            sizeof(currentCharacter));
-        WdfSpinLockRelease(QueueContext->RingBufferToUserModeLock);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-
-        switch (QueueContext->CommandMatchState) {
-        case COMMAND_MATCH_STATE_IDLE:
-            if ((currentCharacter == 'a') || (currentCharacter == 'A')) {
-                QueueContext->CommandMatchState = COMMAND_MATCH_STATE_GOT_A;
-                QueueContext->ConnectCommand = FALSE;
-                QueueContext->IgnoreNextChar = FALSE;
-            }
-            break;
-
-        case COMMAND_MATCH_STATE_GOT_A:
-            if ((currentCharacter == 't') || (currentCharacter == 'T')) {
-                QueueContext->CommandMatchState = COMMAND_MATCH_STATE_GOT_T;
-            }
-            else {
-                QueueContext->CommandMatchState = COMMAND_MATCH_STATE_IDLE;
-            }
-            break;
-
-        case COMMAND_MATCH_STATE_GOT_T:
-            if (!QueueContext->IgnoreNextChar) {
-                if ((currentCharacter == 'A') || (currentCharacter == 'a')) {
-                    QueueContext->ConnectCommand = TRUE;
-                }
-                if ((currentCharacter == 'D') || (currentCharacter == 'd')) {
-                    QueueContext->ConnectCommand = TRUE;
-                }
-            }
-            QueueContext->IgnoreNextChar = TRUE;
-
-            if (currentCharacter == '\r') {
-                QueueContext->CommandMatchState = COMMAND_MATCH_STATE_IDLE;
-                if (QueueContext->ConnectCommand) {
-                    WdfSpinLockAcquire(QueueContext->RingBufferToUserModeLock);
-                    status = RingBufferWrite(&QueueContext->RingBufferToUserMode,
-                        connectString,
-                        connectStringCch);
-                    WdfSpinLockRelease(QueueContext->RingBufferToUserModeLock);
-                    if (!NT_SUCCESS(status)) return status;
-                    QueueContext->CurrentlyConnected = TRUE;
-                    QueueContext->ConnectionStateChanged = TRUE;
-                }
-                else {
-                    WdfSpinLockAcquire(QueueContext->RingBufferToUserModeLock);
-                    status = RingBufferWrite(&QueueContext->RingBufferToUserMode,
-                        okString,
-                        okStringCch);
-                    WdfSpinLockRelease(QueueContext->RingBufferToUserModeLock);
-                    if (!NT_SUCCESS(status)) return status;
-                }
-            }
-            break;
-        default:
-            break;
-        }
+    // If there's nothing to write, we're done.
+    if (Length == 0) {
+        return STATUS_SUCCESS;
     }
+
+    // Acquire the lock to ensure exclusive access to the ring buffer.
+    WdfSpinLockAcquire(QueueContext->RingBufferToUserModeLock);
+
+    // Write the entire block of data from the application to the outgoing ring buffer.
+    // We use RingBufferWritePartial here as it will accept as much data as it can
+    // without overflowing, which is safer. The number of bytes actually written
+    // is returned in bytesWritten.
+    status = RingBufferWritePartial(
+        &QueueContext->RingBufferToUserMode,
+        Characters,
+        Length,
+        &bytesWritten
+    );
+
+    // Release the lock.
+    WdfSpinLockRelease(QueueContext->RingBufferToUserModeLock);
+
+    // For this driver's logic, even a partial write is not an error condition
+    // from the perspective of the calling function (EvtIoWrite), so we
+    // normalize the status to success. The EvtIoWrite function will complete
+    // the original request with the actual number of bytes written.
+    if (status == STATUS_BUFFER_OVERFLOW) {
+        status = STATUS_SUCCESS;
+    }
+
     return status;
 }
 

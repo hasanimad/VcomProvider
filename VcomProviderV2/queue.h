@@ -2,11 +2,6 @@
 
 #define DATA_BUFFER_SIZE 1024
 
-// Device states for command matching
-#define COMMAND_MATCH_STATE_IDLE   0
-#define COMMAND_MATCH_STATE_GOT_A  1
-#define COMMAND_MATCH_STATE_GOT_T  2
-
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 #endif
@@ -14,12 +9,6 @@
 #define MAXULONG 0xffffffff
 
 typedef struct _QUEUE_CONTEXT {
-    UCHAR           CommandMatchState;
-    BOOLEAN         ConnectCommand;
-    BOOLEAN         IgnoreNextChar;
-    BOOLEAN         ConnectionStateChanged;
-    BOOLEAN         CurrentlyConnected;
-
     // ===== Outgoing: App -> Service (drained by IOCTL_VCOM_GET_OUTGOING)
     RING_BUFFER     RingBufferToUserMode;
     WDFSPINLOCK     RingBufferToUserModeLock;
@@ -44,7 +33,6 @@ typedef struct _QUEUE_CONTEXT {
     // Standard queues
     WDFQUEUE        Queue;           // Default parallel queue
     WDFQUEUE        ReadQueue;       // Manual queue for pending reads
-    WDFQUEUE        WaitMaskQueue;   // Manual queue for pending ioctl wait-on-mask
 
     PDEVICE_CONTEXT DeviceContext;   // Back-reference to device context
 
@@ -56,6 +44,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CONTEXT, GetQueueContext);
 EVT_WDF_IO_QUEUE_IO_READ           EvtIoRead;
 EVT_WDF_IO_QUEUE_IO_WRITE          EvtIoWrite;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
+EVT_WDF_IO_QUEUE_IO_CANCELED_ON_QUEUE EvtIoCanceledOnQueue;
 
 // Queue management
 NTSTATUS QueueCreate(_In_ PDEVICE_CONTEXT DeviceContext);

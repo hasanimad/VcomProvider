@@ -136,22 +136,6 @@ RingBufferWritePartial(
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
-RingBufferWrite(
-    _Inout_ PRING_BUFFER      Self,
-    _In_reads_bytes_(DataSize)
-    const BYTE* Data,
-    _In_  size_t              DataSize
-)
-{
-    // Preserve legacy behavior: write what fits and succeed regardless of truncation.
-    size_t written = 0;
-    NTSTATUS s = RingBufferWritePartial(Self, Data, DataSize, &written);
-    UNREFERENCED_PARAMETER(s); // ignore STATUS_BUFFER_OVERFLOW
-    return STATUS_SUCCESS;
-}
-
-_IRQL_requires_max_(DISPATCH_LEVEL)
-NTSTATUS
 RingBufferRead(
     _Inout_ PRING_BUFFER      Self,
     _Out_writes_bytes_to_(DataSize, *BytesCopied)

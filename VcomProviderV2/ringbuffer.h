@@ -47,16 +47,6 @@ extern "C" {
             _In_  size_t              BufferSize
         );
 
-    // Legacy behavior: write as much as fits (possibly truncated) and return STATUS_SUCCESS.
-    _IRQL_requires_max_(DISPATCH_LEVEL)
-        NTSTATUS
-        RingBufferWrite(
-            _Inout_ PRING_BUFFER      Self,
-            _In_reads_bytes_(DataSize)
-            const BYTE* Data,
-            _In_  size_t              DataSize
-        );
-
     // New: report how many bytes were accepted; returns STATUS_SUCCESS if fully written,
     // STATUS_BUFFER_OVERFLOW if truncated (BytesWritten < DataSize).
     _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -110,6 +100,7 @@ extern "C" {
         Self->Tail = Self->Base;
     }
 
+    
 #ifdef __cplusplus
 }
 #endif

@@ -24,10 +24,12 @@ VcomProviderV2.sys = 1
 
 [Standard.NT$ARCH$.10.0...16299]
 %Vcom.DeviceDesc% = Vcom_Install, ROOT\VCOM_VPORT
+%Vcom.DeviceDesc% = Vcom_Install, SWD\VCom\VCOM_VPORT
 
 ; ===================== Install (DDInstall) =====================
 [Vcom_Install.NT]
 CopyFiles = Vcom.Copy
+AddInterface = %VCOM.ControlInterface.GUID%
 
 [Vcom.Copy]
 VcomProviderV2.sys
@@ -56,3 +58,4 @@ ManufacturerName = "Hasan"
 DiskName = "VCOM Driver"
 Vcom.DeviceDesc = "VCOM Virtual Serial Port"
 Vcom.ServiceDesc = "VCOM Virtual Serial Port Driver"
+VCOM.ControlInterface.GUID = "{8E25B239-36F1-4568-B6A5-69A6272555E7}" // <-- ADD THIS LINE
