@@ -44,10 +44,9 @@ DeviceCreate(
 	pDeviceContext->Device = device;
 	pDeviceContext->Started = FALSE;
 
-	// Initialize our manual lock fields
 	pDeviceContext->ComPortIsOpen = FALSE;
 	pDeviceContext->ComPortFileObject = NULL;
-	pDeviceContext->ControlFileObject = NULL; // Initialize the new field
+	pDeviceContext->ControlFileObject = NULL; 
 
 	// Initialize standard serial port state
 	pDeviceContext->BaudRate = 9600;
@@ -58,7 +57,6 @@ DeviceCreate(
 	RtlZeroMemory(&pDeviceContext->Timeouts, sizeof(pDeviceContext->Timeouts));
 	pDeviceContext->FlowControl = 0;
 
-	// Set PnP capabilities. This is the correct way to prevent disabling.
 	WDF_DEVICE_PNP_CAPABILITIES_INIT(&pnpCaps);
 	pnpCaps.SurpriseRemovalOK = WdfTrue;
 	pnpCaps.Removable = WdfTrue;
@@ -315,76 +313,6 @@ _exit:
 }
 
 VOID
-VcomEvtFileCleanup(
-	_In_ WDFFILEOBJECT FileObject
-)
-{
-	WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
-	PDEVICE_CONTEXT devCtx = GetDeviceContext(device);
-
-	// --- FINAL, CORRECTED LOGIC ---
-
-	// The ONLY responsibility of this callback is to update the device's connection state.
-	// DO NOT call any blocking functions like WdfIoQueuePurgeSynchronously here.
-	// The framework will automatically cancel pending requests associated with this FileObject,
-	// and your EvtIoCanceledOnQueue callback will complete them. This breaks the deadlock.
-
-	if (devCtx->ControlFileObject == FileObject)
-	{
-		KdPrint(("VCOM: Control handle cleanup. Clearing reference.\n"));
-		devCtx->ControlFileObject = NULL;
-		devCtx->Started = FALSE; // Also ensure the I/O gate is closed.
-	}
-	else if (devCtx->ComPortFileObject == FileObject)
-	{
-		KdPrint(("VCOM: COM port handle cleanup. Clearing reference.\n"));
-		devCtx->ComPortFileObject = NULL;
-		devCtx->ComPortIsOpen = FALSE;
-	}
-}
-
-VOID
-VcomEvtFileClose(_In_ WDFFILEOBJECT FileObject)
-{
-	UNREFERENCED_PARAMETER(FileObject);
-	// Nothing else to do; Cleanup already purged/cleared
-}
-
-//VOID
-//VcomEvtFileCreate(
-//	_In_ WDFDEVICE     Device,
-//	_In_ WDFREQUEST    Request,
-//	_In_ WDFFILEOBJECT FileObject
-//)
-//{
-//	PDEVICE_CONTEXT devCtx = GetDeviceContext(Device);
-//	PUNICODE_STRING fileName = WdfFileObjectGetFileName(FileObject);
-//
-//	// If this is an open for the public COM port (filename present) then we may lock it.
-//	NTSTATUS status = STATUS_SUCCESS; // Assume success initially
-//
-//	if (fileName != NULL) // PuTTY path
-//	{
-//		if (devCtx->ComPortIsOpen) {
-//			status = STATUS_ACCESS_DENIED; // Set status to deny
-//		}
-//		else {
-//			devCtx->ComPortIsOpen = TRUE;  // Set the lock
-//			devCtx->ComPortFileObject = FileObject;
-//		}
-//	}
-//	else // Control App path
-//	{
-//		if (devCtx->Started) {
-//			status = STATUS_ACCESS_DENIED; // Set status to deny
-//		}
-//	}
-//
-//	// A single, final completion call for all paths.
-//	WdfRequestComplete(Request, status);
-//}
-
-VOID
 VcomEvtFileCreate(
 	_In_ WDFDEVICE     Device,
 	_In_ WDFREQUEST    Request,
@@ -395,7 +323,6 @@ VcomEvtFileCreate(
 	PUNICODE_STRING fileName = WdfFileObjectGetFileName(FileObject);
 	NTSTATUS status = STATUS_SUCCESS;
 
-	// --- NEW LOGIC ---
 	KdPrint(("VCOM: FileCreate request received.\n"));
 	KdPrint(("VCOM: FileName: %ws\n", fileName->Buffer));
 	// Case 1 Control App
@@ -432,6 +359,38 @@ VcomEvtFileCreate(
 
 	WdfRequestComplete(Request, status);
 }
+
+VOID
+VcomEvtFileCleanup(
+	_In_ WDFFILEOBJECT FileObject
+)
+{
+	WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
+	PDEVICE_CONTEXT devCtx = GetDeviceContext(device);
+
+	
+	if (devCtx->ControlFileObject == FileObject)
+	{
+		KdPrint(("VCOM: Control handle cleanup. Clearing reference.\n"));
+		devCtx->ControlFileObject = NULL;
+		devCtx->Started = FALSE; // Also ensure the I/O gate is closed.
+	}
+	else if (devCtx->ComPortFileObject == FileObject)
+	{
+		KdPrint(("VCOM: COM port handle cleanup. Clearing reference.\n"));
+		devCtx->ComPortFileObject = NULL;
+		devCtx->ComPortIsOpen = FALSE;
+	}
+}
+
+VOID
+VcomEvtFileClose(_In_ WDFFILEOBJECT FileObject)
+{
+	UNREFERENCED_PARAMETER(FileObject);
+	}
+
+
+
 
 ULONG GetBaudRate(_In_ PDEVICE_CONTEXT Ctx) {
 	return (ULONG)ReadNoFence((LONG*)&Ctx->BaudRate);
