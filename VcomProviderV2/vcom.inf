@@ -45,6 +45,12 @@ ErrorControl  = 1                 ; SERVICE_ERROR_NORMAL
 ServiceBinary = %13%\VcomProviderV2.sys
 
 ; ===================== KMDF =====================
+[Vcom_Install.NT.CoInstallers]
+AddReg=Vcom.CoInstaller.AddReg
+CopyFiles=Vcom.CoInstaller.CopyFiles
+
+[Vcom.CoInstaller.AddReg]
+HKR,,CoInstallers32,0x00010000,"WdfCoInstaller01011.dll,WdfCoInstaller"
 [Vcom_Install.NT.Wdf]
 KmdfService = vcom, Vcom.Wdf
 
