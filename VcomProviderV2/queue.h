@@ -34,6 +34,7 @@ typedef struct _QUEUE_CONTEXT {
     WDFQUEUE        Queue;           // Default parallel queue
     WDFQUEUE        ReadQueue;       // Manual queue for pending reads
 
+
     PDEVICE_CONTEXT DeviceContext;   // Back-reference to device context
 
 } QUEUE_CONTEXT, * PQUEUE_CONTEXT;

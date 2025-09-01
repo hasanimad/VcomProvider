@@ -12,12 +12,11 @@ QueueCreate(
     WDFQUEUE                queue;
     PQUEUE_CONTEXT          queueContext;
 
-    // ================================
+    
     // 1) Create the default parallel queue
-    // ================================
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(
         &queueConfig,
-        WdfIoQueueDispatchSequential);
+        WdfIoQueueDispatchParallel);
 
     queueConfig.EvtIoRead = EvtIoRead;
     queueConfig.EvtIoWrite = EvtIoWrite;
@@ -43,9 +42,7 @@ QueueCreate(
     queueContext->DeviceContext = DeviceContext;
     queueContext->DeviceContext->IoQueue = queue; // let cleanup reach our manual queues & rings
 
-    // ================================
     // 2) Manual queue for pending reads (IRP_MJ_READ)
-    // ================================
     WDF_IO_QUEUE_CONFIG_INIT(
         &queueConfig,
         WdfIoQueueDispatchManual);
@@ -65,9 +62,7 @@ QueueCreate(
 
     queueContext->ReadQueue = queue;
 
-    // ================================
     // 3) Manual queue for pending IOCTL_VCOM_GET_OUTGOING
-    // ================================
     WDF_IO_QUEUE_CONFIG_INIT(
         &queueConfig,
         WdfIoQueueDispatchManual);
@@ -85,9 +80,7 @@ QueueCreate(
         return status;
     }
 
-    // ================================
     // 4) Create spinlocks for each ring
-    // ================================
     status = WdfSpinLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &queueContext->RingBufferToUserModeLock);
     if (!NT_SUCCESS(status)) {
         Trace(TRACE_LEVEL_ERROR, "RingBufferToUserModeLock create failed 0x%x", status);
@@ -100,9 +93,7 @@ QueueCreate(
         return status;
     }
 
-    // ================================
     // 5) Allocate nonpaged backing storage via KMDF and init rings
-    // ================================
     WDF_OBJECT_ATTRIBUTES memAttr;
     WDF_OBJECT_ATTRIBUTES_INIT(&memAttr);
     // Tie lifetime to the default queue; device lifetime works too
@@ -276,8 +267,8 @@ EvtIoDeviceControl(
 
     case IOCTL_SERIAL_GET_TIMEOUTS:
     {
-        SERIAL_TIMEOUTS timeoutValues = { 0 };
-        status = RequestCopyFromBuffer(Request, (void*)&timeoutValues, sizeof(timeoutValues));
+
+        status = RequestCopyFromBuffer(Request, (void*)&deviceContext->Timeouts, sizeof(deviceContext->Timeouts));
         break;
     }
 
@@ -302,17 +293,13 @@ EvtIoDeviceControl(
 
     case IOCTL_SERIAL_WAIT_ON_MASK:
     {
-        // For our simple pipe, we don't implement this. We will just hold
-        // the request and never complete it, which is valid behavior for a
-        // serial port where the requested event might never occur.
-        // To prevent the request from being held forever and leaking if the
-        // handle is closed, we forward it to a queue that gets purged.
-        // The main default queue works for this.
-        status = WdfRequestForwardToIoQueue(Request, Queue);
-        if (!NT_SUCCESS(status)) {
-            WdfRequestComplete(Request, status);
-        }
-        return; // Must return here, do not complete below.
+        // Forward the request to our dedicated manual queue to pend it.
+    // WDF will handle cleanup if the file handle is closed.
+        ULONG* pMask = NULL;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(ULONG), &pMask, NULL);
+        // Complete the request, returning 0 events.
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, 0);
+        return;
     }
 
     case IOCTL_SERIAL_SET_WAIT_MASK:
@@ -362,7 +349,7 @@ EvtIoDeviceControl(
         // No data: pend on manual OutgoingQueue
         status = WdfRequestForwardToIoQueue(Request, queueContext->OutgoingQueue);
         if (!NT_SUCCESS(status)) {
-            Trace(TRACE_LEVEL_ERROR, "GET_OUTGOING forward failed 0x%x", status);
+            Trace(TRACE_LEVEL_ERROR, "GET_OUTGOING forward failed (WdfRequestForwardToIoQueue:Outgoing) 0x%x", status);
             WdfRequestComplete(Request, status);
         }
         return; // don't complete here
@@ -403,6 +390,13 @@ EvtIoDeviceControl(
     }
     
     case IOCTL_VCOM_START:
+        
+        (void)WdfIoQueueStart(queueContext->Queue);
+        (void)WdfIoQueueStart(queueContext->ReadQueue);
+        (void)WdfIoQueueStart(queueContext->OutgoingQueue);
+
+
+        KdPrint(("VCOM: I/O Queues started.\n"));
     {
         deviceContext->Started = TRUE;
         WdfSpinLockAcquire(queueContext->RingBufferToUserModeLock);
@@ -418,20 +412,24 @@ EvtIoDeviceControl(
     }
     case IOCTL_VCOM_STOP:
     {
+        WDFREQUEST req;
+
+        KdPrint(("VCOM: IOCTL_VCOM_STOP received. Draining queues.\n"));
+        // Close the gate so new operations see device stopped
         deviceContext->Started = FALSE;
-        WdfIoQueuePurgeSynchronously(queueContext->ReadQueue);
-        WdfIoQueuePurgeSynchronously(queueContext->OutgoingQueue);
-        
 
-        WdfSpinLockAcquire(queueContext->RingBufferToUserModeLock);
-        RingBufferReset(&queueContext->RingBufferToUserMode);
-        WdfSpinLockRelease(queueContext->RingBufferToUserModeLock);
+        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(queueContext->ReadQueue, &req))) {
+            KdPrint(("VCOM: Completing pending read request during STOP.\n"));
+            WdfRequestComplete(req, STATUS_CANCELLED);
+        }
 
-        WdfSpinLockAcquire(queueContext->RingBufferFromNetworkLock);
-        RingBufferReset(&queueContext->RingBufferFromNetwork);
-        WdfSpinLockRelease(queueContext->RingBufferFromNetworkLock);
+        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(queueContext->OutgoingQueue, &req))) {
+            KdPrint(("VCOM: Completing pending outgoing request during STOP.\n"));
+            WdfRequestComplete(req, STATUS_CANCELLED);
+        }
 
-        status = STATUS_SUCCESS;
+        status = STATUS_SUCCESS; 
+        KdPrint(("VCOM: IOCTL_VCOM_STOP Finished.\n"));
         break;
     }
     default:
@@ -453,7 +451,6 @@ EvtIoWrite(
     NTSTATUS                status;
     PQUEUE_CONTEXT          queueContext = GetQueueContext(Queue);
     WDFMEMORY               memory;
-    //WDFREQUEST              savedRequest;
     size_t                  availableData = 0;
 
     Trace(TRACE_LEVEL_INFO, "EvtIoWrite 0x%p", Request);
@@ -467,6 +464,7 @@ EvtIoWrite(
     status = WdfRequestRetrieveInputMemory(Request, &memory);
     if (!NT_SUCCESS(status)) {
         Trace(TRACE_LEVEL_ERROR, "Error: WdfRequestRetrieveInputMemory failed 0x%x", status);
+        WdfRequestComplete(Request, status);
         return;
     }
 
@@ -476,6 +474,7 @@ EvtIoWrite(
         (PUCHAR)WdfMemoryGetBuffer(memory, NULL),
         Length);
     if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
         return;
     }
 
@@ -533,11 +532,15 @@ EvtIoWrite(
             // and retrieving the request. Re-queue it.
             s = WdfRequestForwardToIoQueue(getOutgoingRequest, queueContext->OutgoingQueue);
             if (!NT_SUCCESS(s)) {
-                // If forwarding fails (e.g., queue is being purged), complete it to prevent a leak.
-                WdfRequestComplete(getOutgoingRequest, s);
+                Trace(TRACE_LEVEL_ERROR, "Forward read after PUSH failed 0x%x", s);
+                // If invalid state, complete canceled to avoid leaks
+                if (s == STATUS_WDF_REQUEST_INVALID_STATE || s == STATUS_CANCELLED) {
+                    WdfRequestComplete(getOutgoingRequest, STATUS_CANCELLED);
+                }
+                else {
+                    WdfRequestComplete(getOutgoingRequest, s);
+                }
             }
-            // The ring buffer is empty now, so no point in trying to wake more requests.
-            break;
         }
     }
 }
@@ -591,7 +594,7 @@ EvtIoRead(
     // No data: pend this read until PUSH_INCOMING arrives
     status = WdfRequestForwardToIoQueue(Request, queueContext->ReadQueue);
     if (!NT_SUCCESS(status)) {
-        Trace(TRACE_LEVEL_ERROR, "Error: WdfRequestForwardToIoQueue failed 0x%x", status);
+        Trace(TRACE_LEVEL_ERROR, "Error: WdfRequestForwardToIoQueue(Read Queue) failed 0x%x", status);
         WdfRequestComplete(Request, status);
     }
 }

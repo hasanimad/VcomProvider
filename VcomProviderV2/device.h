@@ -36,6 +36,7 @@ typedef struct _DEVICE_CONTEXT {
 	BOOLEAN bCreatedLegacyHardwareKey;
 
 	WDFFILEOBJECT ComPortFileObject;
+	WDFFILEOBJECT ControlFileObject;  // Handle for our control client app
 	BOOLEAN ComPortIsOpen;
 
 } DEVICE_CONTEXT, * PDEVICE_CONTEXT;

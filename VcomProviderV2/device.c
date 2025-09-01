@@ -14,6 +14,7 @@ DeviceCreate(
 	WDF_FILEOBJECT_CONFIG fileCfg;
 	WDFDEVICE device;
 	PDEVICE_CONTEXT pDeviceContext;
+	WDF_DEVICE_PNP_CAPABILITIES pnpCaps;
 
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, DEVICE_CONTEXT);
 	deviceAttributes.EvtCleanupCallback = VcomEvtDeviceCleanup;
@@ -24,8 +25,6 @@ DeviceCreate(
 		VcomEvtFileClose,
 		VcomEvtFileCleanup);
 
-	// Use WDF_NO_OBJECT_ATTRIBUTES for the file object config.
-	// This resolves the 0xC0000010 error.
 	WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileCfg, WDF_NO_OBJECT_ATTRIBUTES);
 
 	WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_SERIAL_PORT);
@@ -43,11 +42,12 @@ DeviceCreate(
 
 	pDeviceContext = GetDeviceContext(device);
 	pDeviceContext->Device = device;
-	pDeviceContext->Started = TRUE;
+	pDeviceContext->Started = FALSE;
 
 	// Initialize our manual lock fields
 	pDeviceContext->ComPortIsOpen = FALSE;
 	pDeviceContext->ComPortFileObject = NULL;
+	pDeviceContext->ControlFileObject = NULL; // Initialize the new field
 
 	// Initialize standard serial port state
 	pDeviceContext->BaudRate = 9600;
@@ -57,12 +57,17 @@ DeviceCreate(
 	pDeviceContext->ValidDataMask = 0xFF;
 	RtlZeroMemory(&pDeviceContext->Timeouts, sizeof(pDeviceContext->Timeouts));
 	pDeviceContext->FlowControl = 0;
-	pDeviceContext->PdoName = NULL;
-	pDeviceContext->bCreatedLegacyHardwareKey = FALSE;
+
+	// Set PnP capabilities. This is the correct way to prevent disabling.
+	WDF_DEVICE_PNP_CAPABILITIES_INIT(&pnpCaps);
+	pnpCaps.SurpriseRemovalOK = WdfTrue;
+	pnpCaps.Removable = WdfTrue;
+	WdfDeviceSetPnpCapabilities(device, &pnpCaps);
 
 	*DeviceContext = pDeviceContext;
 	return status;
 }
+
 
 NTSTATUS DeviceConfigure(
 	_In_ PDEVICE_CONTEXT DeviceContext
@@ -78,32 +83,19 @@ NTSTATUS DeviceConfigure(
 	DECLARE_UNICODE_STRING_SIZE(symbolicLinkName, SYMBOLIC_LINK_NAME_LENGTH);
 
 	guid = (LPGUID)&GUID_DEVINTERFACE_COMPORT;
-
+	
 	status = WdfDeviceCreateDeviceInterface(
-		device, 
-		guid, 
+		device,
+		guid,
 		NULL);
 	if (!NT_SUCCESS(status)) {
 		KdPrint(("Device Interface Creation failed with status 0x%08X\n", status));
 		goto _exit;
 	}
 
-	status = WdfDeviceCreateDeviceInterface(
-		device,
-		&GUID_DEVINTERFACE_VCOM_CONTROL, // Our custom private GUID
-		NULL);                           // No reference string
-
-	if (!NT_SUCCESS(status)) {
-		KdPrint(("Device Interface Creation (Control) failed with status 0x%08X\n", status));
-		return status;
-	}
-	else {
-		KdPrint(("Device Interface Creation (Control) succeeded\n"));
-	}
-
 	status = WdfDeviceOpenRegistryKey(
-		device, 
-		PLUGPLAY_REGKEY_DEVICE, 
+		device,
+		PLUGPLAY_REGKEY_DEVICE,
 		KEY_QUERY_VALUE,
 		WDF_NO_OBJECT_ATTRIBUTES,
 		&registryKey);
@@ -112,7 +104,7 @@ NTSTATUS DeviceConfigure(
 		goto _exit;
 	}
 	status = WdfRegistryQueryUnicodeString(
-		registryKey, 
+		registryKey,
 		&portName,
 		NULL,
 		&comPort);
@@ -158,7 +150,7 @@ NTSTATUS DeviceConfigure(
 	}
 
 	status = WdfDeviceCreateSymbolicLink(
-		device, 
+		device,
 		&symbolicLinkName);
 	if (!NT_SUCCESS(status)) {
 		KdPrint(("Failed to create device symbolic link with status 0x%08X\n", status));
@@ -182,6 +174,20 @@ NTSTATUS DeviceConfigure(
 		KdPrint(("Failed to create I/O queue with status 0x%08X\n", status));
 		goto _exit;
 	}
+
+	status = WdfDeviceCreateDeviceInterface(
+		device,
+		&GUID_DEVINTERFACE_VCOM_CONTROL, // Our custom private GUID
+		&comPort);
+
+	if (!NT_SUCCESS(status)) {
+		KdPrint(("Device Interface Creation (Control) failed with status 0x%08X\n", status));
+		goto _exit;
+	}
+	else {
+		KdPrint(("Device Interface Creation (Control) for %wZ succeeded\n", &comPort));
+	}
+
 _exit:
 	if(registryKey)	WdfRegistryClose(registryKey);
 	return status;
@@ -316,29 +322,24 @@ VcomEvtFileCleanup(
 	WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
 	PDEVICE_CONTEXT devCtx = GetDeviceContext(device);
 
-	// Check if the handle being closed is the one we stored for the COM port.
-	if (devCtx->ComPortFileObject == FileObject)
+	// --- FINAL, CORRECTED LOGIC ---
+
+	// The ONLY responsibility of this callback is to update the device's connection state.
+	// DO NOT call any blocking functions like WdfIoQueuePurgeSynchronously here.
+	// The framework will automatically cancel pending requests associated with this FileObject,
+	// and your EvtIoCanceledOnQueue callback will complete them. This breaks the deadlock.
+
+	if (devCtx->ControlFileObject == FileObject)
 	{
-		// It is. This means PuTTY (or another COM app) is closing.
-		// Release the lock so another app can connect.
-		KdPrint(("VCOM: COM port handle closed. Releasing lock.\n"));
-		devCtx->ComPortIsOpen = FALSE;
-		devCtx->ComPortFileObject = NULL; // Clear the stored handle
+		KdPrint(("VCOM: Control handle cleanup. Clearing reference.\n"));
+		devCtx->ControlFileObject = NULL;
+		devCtx->Started = FALSE; // Also ensure the I/O gate is closed.
 	}
-
-	// Perform standard queue and buffer cleanup for all closing handles.
-	if (devCtx->IoQueue) {
-		PQUEUE_CONTEXT qc = GetQueueContext(devCtx->IoQueue);
-		WdfIoQueuePurgeSynchronously(qc->ReadQueue);
-		WdfIoQueuePurgeSynchronously(qc->OutgoingQueue);
-
-		WdfSpinLockAcquire(qc->RingBufferFromNetworkLock);
-		RingBufferReset(&qc->RingBufferFromNetwork);
-		WdfSpinLockRelease(qc->RingBufferFromNetworkLock);
-
-		WdfSpinLockAcquire(qc->RingBufferToUserModeLock);
-		RingBufferReset(&qc->RingBufferToUserMode);
-		WdfSpinLockRelease(qc->RingBufferToUserModeLock);
+	else if (devCtx->ComPortFileObject == FileObject)
+	{
+		KdPrint(("VCOM: COM port handle cleanup. Clearing reference.\n"));
+		devCtx->ComPortFileObject = NULL;
+		devCtx->ComPortIsOpen = FALSE;
 	}
 }
 
@@ -349,6 +350,40 @@ VcomEvtFileClose(_In_ WDFFILEOBJECT FileObject)
 	// Nothing else to do; Cleanup already purged/cleared
 }
 
+//VOID
+//VcomEvtFileCreate(
+//	_In_ WDFDEVICE     Device,
+//	_In_ WDFREQUEST    Request,
+//	_In_ WDFFILEOBJECT FileObject
+//)
+//{
+//	PDEVICE_CONTEXT devCtx = GetDeviceContext(Device);
+//	PUNICODE_STRING fileName = WdfFileObjectGetFileName(FileObject);
+//
+//	// If this is an open for the public COM port (filename present) then we may lock it.
+//	NTSTATUS status = STATUS_SUCCESS; // Assume success initially
+//
+//	if (fileName != NULL) // PuTTY path
+//	{
+//		if (devCtx->ComPortIsOpen) {
+//			status = STATUS_ACCESS_DENIED; // Set status to deny
+//		}
+//		else {
+//			devCtx->ComPortIsOpen = TRUE;  // Set the lock
+//			devCtx->ComPortFileObject = FileObject;
+//		}
+//	}
+//	else // Control App path
+//	{
+//		if (devCtx->Started) {
+//			status = STATUS_ACCESS_DENIED; // Set status to deny
+//		}
+//	}
+//
+//	// A single, final completion call for all paths.
+//	WdfRequestComplete(Request, status);
+//}
+
 VOID
 VcomEvtFileCreate(
 	_In_ WDFDEVICE     Device,
@@ -358,28 +393,44 @@ VcomEvtFileCreate(
 {
 	PDEVICE_CONTEXT devCtx = GetDeviceContext(Device);
 	PUNICODE_STRING fileName = WdfFileObjectGetFileName(FileObject);
+	NTSTATUS status = STATUS_SUCCESS;
 
-	// Check if the open request is for the public COM port by checking for a filename.
+	// --- NEW LOGIC ---
+	KdPrint(("VCOM: FileCreate request received.\n"));
+	KdPrint(("VCOM: FileName: %ws\n", fileName->Buffer));
+	// Case 1 Control App
 	if (fileName != NULL && fileName->Length > 0)
 	{
-		// This is a COM port open request (e.g., from PuTTY).
-		// Check our manual lock.
-		if (devCtx->ComPortIsOpen)
+		KdPrint(("VCOM: FileCreate request for Control Interface\n"));
+		if (devCtx->ControlFileObject != NULL) // Check if a handle is already stored
 		{
-			// Port is already open. Deny access.
-			WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
-			return;
+			KdPrint(("VCOM: Control Interface is already open. Denying access.\n"));
+			status = STATUS_ACCESS_DENIED;
 		}
 		else
 		{
-			// Port is available. Grant access, set the lock, and store the handle.
-			devCtx->ComPortIsOpen = TRUE;
-			devCtx->ComPortFileObject = FileObject;
+			KdPrint(("VCOM: Granting access to Control Interface.\n"));
+			devCtx->ControlFileObject = FileObject; // Store the handle
 		}
 	}
-	// If there's no filename, it's our private control app. Always allow it.
+	// Case 1: Serial App
+	else
+	{
+		KdPrint(("VCOM: FileCreate request for COM Port\n"));
+		if (devCtx->ComPortFileObject != NULL) // Check if a handle is already stored
+		{
+			KdPrint(("VCOM: COM Port is already open. Denying access.\n"));
+			status = STATUS_ACCESS_DENIED;
+		}
+		else
+		{
+			KdPrint(("VCOM: Granting access to COM Port.\n"));
+			devCtx->ComPortFileObject = FileObject; // Store the handle
+			devCtx->ComPortIsOpen = TRUE;           // Set the flag
+		}
+	}
 
-	WdfRequestComplete(Request, STATUS_SUCCESS);
+	WdfRequestComplete(Request, status);
 }
 
 ULONG GetBaudRate(_In_ PDEVICE_CONTEXT Ctx) {
@@ -392,6 +443,7 @@ VOID SetBaudRate(
 ) {
 	InterlockedExchange((LONG*)&Ctx->BaudRate, (LONG)BaudRate);
 }
+
 PULONG GetModemControlRegister(
 	_Inout_ PDEVICE_CONTEXT Ctx
 ) { return &Ctx->ModemControlRegister; }
