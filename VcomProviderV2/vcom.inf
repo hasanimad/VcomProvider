@@ -45,12 +45,6 @@ ErrorControl  = 1                 ; SERVICE_ERROR_NORMAL
 ServiceBinary = %13%\VcomProviderV2.sys
 
 ; ===================== KMDF =====================
-[Vcom_Install.NT.CoInstallers]
-AddReg=Vcom.CoInstaller.AddReg
-CopyFiles=Vcom.CoInstaller.CopyFiles
-
-[Vcom.CoInstaller.AddReg]
-HKR,,CoInstallers32,0x00010000,"WdfCoInstaller01011.dll,WdfCoInstaller"
 [Vcom_Install.NT.Wdf]
 KmdfService = vcom, Vcom.Wdf
 
@@ -64,4 +58,4 @@ ManufacturerName = "Hasan"
 DiskName = "VCOM Driver"
 Vcom.DeviceDesc = "VCOM Virtual Serial Port"
 Vcom.ServiceDesc = "VCOM Virtual Serial Port Driver"
-VCOM.ControlInterface.GUID = "{8E25B239-36F1-4568-B6A5-69A6272555E7}" // <-- ADD THIS LINE
+VCOM.ControlInterface.GUID = "{8E25B239-36F1-4568-B6A5-69A6272555E7}"

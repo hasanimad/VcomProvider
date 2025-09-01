@@ -266,11 +266,12 @@ _exit:
 	return status;
 }
 
-VOID VcomEvtDeviceCleanup(
-	_In_ WDFOBJECT Device
+VOID
+VcomEvtDeviceCleanup(
+	_In_ WDFOBJECT DeviceAsObject
 )
 {
-	WDFDEVICE device = (WDFDEVICE)Device;
+	WDFDEVICE device = (WDFDEVICE)DeviceAsObject;
 	PDEVICE_CONTEXT deviceContext = GetDeviceContext(device);
 	NTSTATUS status;
 	WDFKEY key = NULL;
@@ -278,10 +279,9 @@ VOID VcomEvtDeviceCleanup(
 
 	DECLARE_CONST_UNICODE_STRING(deviceSubkey, SERIAL_DEVICE_MAP);
 
-	if (deviceContext->bCreatedLegacyHardwareKey== TRUE && deviceContext->PdoName) {
-
+	if (deviceContext->bCreatedLegacyHardwareKey == TRUE && deviceContext->PdoName)
+	{
 		RtlInitUnicodeString(&PdoString, deviceContext->PdoName);
-
 		status = WdfDeviceOpenDevicemapKey(
 			device,
 			&deviceSubkey,
@@ -289,27 +289,12 @@ VOID VcomEvtDeviceCleanup(
 			WDF_NO_OBJECT_ATTRIBUTES,
 			&key);
 
-		if (!NT_SUCCESS(status)) {
-			KdPrint(("Error: Failed to open DEVICEMAP\\SERIALCOMM key 0x%x", status));
-			goto _exit;
-		}
-
-		status = WdfRegistryRemoveValue(
-			key,
-			&PdoString);
-		if (!NT_SUCCESS(status)) {
-			KdPrint(("Error: Failed to delete %S key, 0x%x", PdoString.Buffer, status));
-			goto _exit;
+		if (NT_SUCCESS(status))
+		{
+			WdfRegistryRemoveValue(key, &PdoString); // Best effort, ignore status
+			WdfRegistryClose(key);
 		}
 	}
-_exit:
-
-	if (key != NULL) {
-		WdfRegistryClose(key);
-		key = NULL;
-	}
-	return;
-
 }
 
 VOID
@@ -368,18 +353,41 @@ VcomEvtFileCleanup(
 	WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
 	PDEVICE_CONTEXT devCtx = GetDeviceContext(device);
 
-	
+	if (devCtx->IoQueue == NULL) {
+		return;
+	}
+
+	PQUEUE_CONTEXT queueCtx = GetQueueContext(devCtx->IoQueue);
+
+	// Identify which handle is being closed and clear its reference
 	if (devCtx->ControlFileObject == FileObject)
 	{
-		KdPrint(("VCOM: Control handle cleanup. Clearing reference.\n"));
+		KdPrint(("VCOM: Control App handle is closing.\n"));
 		devCtx->ControlFileObject = NULL;
-		devCtx->Started = FALSE; // Also ensure the I/O gate is closed.
 	}
 	else if (devCtx->ComPortFileObject == FileObject)
 	{
-		KdPrint(("VCOM: COM port handle cleanup. Clearing reference.\n"));
+		KdPrint(("VCOM: COM Port handle is closing.\n"));
 		devCtx->ComPortFileObject = NULL;
+	}
+
+	if (devCtx->ControlFileObject == NULL && devCtx->ComPortFileObject == NULL)
+	{
+		KdPrint(("VCOM: Last handle closed. Performing full session cleanup.\n"));
+
+		devCtx->Started = FALSE;
 		devCtx->ComPortIsOpen = FALSE;
+
+		WdfIoQueuePurgeSynchronously(queueCtx->ReadQueue);
+		WdfIoQueuePurgeSynchronously(queueCtx->OutgoingQueue);
+
+		WdfSpinLockAcquire(queueCtx->RingBufferFromNetworkLock);
+		RingBufferReset(&queueCtx->RingBufferFromNetwork);
+		WdfSpinLockRelease(queueCtx->RingBufferFromNetworkLock);
+
+		WdfSpinLockAcquire(queueCtx->RingBufferToUserModeLock);
+		RingBufferReset(&queueCtx->RingBufferToUserMode);
+		WdfSpinLockRelease(queueCtx->RingBufferToUserModeLock);
 	}
 }
 
